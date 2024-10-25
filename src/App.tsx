@@ -3,6 +3,47 @@ import "./index.css";
 import Twemoji from "react-twemoji";
 import { CookieData } from "./background";
 
+interface CanvasOperations {
+  text: boolean;
+  gradient: boolean;
+  imageData: boolean;
+  readback: boolean;
+}
+
+interface CanvasSize {
+  width: number;
+  height: number;
+}
+
+interface CanvasAttributes {
+  willReadFrequently: boolean;
+}
+
+interface CanvasDetails {
+  id: string;
+  size: CanvasSize;
+  operations: CanvasOperations;
+  hidden: boolean;
+  attributes: CanvasAttributes;
+}
+
+interface CanvasFingerprintingInfo {
+  details: CanvasDetails[];
+  suspiciousScore: number;
+  potentialFingerprinting: boolean;
+}
+
+interface DetectionResponse {
+  localStorageUsage: number;
+  canvasElements: number;
+  cookieCount: number;
+  cookies: string[];
+  canvasFingerprinting: CanvasFingerprintingInfo;
+}
+
+// Type for the message listener callback
+type SendResponseCallback = (response: DetectionResponse) => void;
+
 const byteValueNumberFormatter = Intl.NumberFormat("en", {
   notation: "compact",
   style: "unit",
@@ -23,13 +64,133 @@ const cookieCategoryMappings = {
   Other: "Outros",
 };
 
+function calculatePrivacyScore(
+  data: DetectionResponse,
+  thirdPartyDomains: string[],
+  thirdPartyCookies: Record<string, CookieData>,
+  commonlyBlockedDomains: string[],
+  cookieDatabase: any[]
+) {
+  let score = 0;
+  const details: Record<string, number> = {};
+
+  const localStorageScore = Math.min(
+    10,
+    (data?.localStorageUsage / 1024) * 0.5
+  );
+  details.localStorage = localStorageScore;
+
+  let firstPartyCookieScore = 0;
+  data?.cookies.forEach((cookie) => {
+    const cookieName = cookie.split("=")[0];
+    const cookieData = cookieDatabase.find((c) => c.name === cookieName);
+
+    let cookieScore = 1;
+
+    if (cookieData) {
+      switch (cookieData.category) {
+        case "Marketing":
+        case "Advertising":
+          cookieScore = 3;
+          break;
+        case "Analytics":
+        case "Statistics":
+          cookieScore = 2;
+          break;
+      }
+    }
+    firstPartyCookieScore += cookieScore;
+  });
+  details.firstPartyCookies = Math.min(15, firstPartyCookieScore);
+
+  let thirdPartyCookieScore = 0;
+  Object.entries(thirdPartyCookies).forEach(([domain, cookieData]) => {
+    const cookieInfo = cookieDatabase.find((c) => c.name === cookieData.name);
+
+    let cookieScore = 2;
+
+    if (cookieInfo) {
+      switch (cookieInfo.category) {
+        case "Marketing":
+        case "Advertising":
+          cookieScore = 5;
+          break;
+        case "Analytics":
+        case "Statistics":
+          cookieScore = 4;
+          break;
+      }
+    }
+    thirdPartyCookieScore += cookieScore;
+  });
+  details.thirdPartyCookies = Math.min(20, thirdPartyCookieScore);
+
+  // Canvas Fingerprinting Score (15 points if detected)
+  const canvasFingerprintingScore = data?.canvasFingerprinting
+    .potentialFingerprinting
+    ? 15
+    : 0;
+  details.canvasFingerprinting = canvasFingerprintingScore;
+
+  // Third-party Domains Score (1 point per domain, 3 points if in blocklist, max 40 points)
+  let thirdPartyDomainScore = 0;
+  thirdPartyDomains.forEach((domain) => {
+    thirdPartyDomainScore += commonlyBlockedDomains.includes(domain) ? 3 : 1;
+  });
+  details.thirdPartyDomains = Math.min(40, thirdPartyDomainScore);
+
+  score = Object.values(details).reduce((a, b) => a + b, 0);
+  return {
+    total: Math.round(score),
+    details,
+    cookieBreakdown: {
+      marketing: data?.cookies.filter((c) => {
+        const cookieName = c.split("=")[0];
+        const cookieData = cookieDatabase.find((cd) => cd.name === cookieName);
+        return (
+          cookieData?.category === "Marketing" ||
+          cookieData?.category === "Advertising"
+        );
+      }).length,
+      analytics: data?.cookies.filter((c) => {
+        const cookieName = c.split("=")[0];
+        const cookieData = cookieDatabase.find((cd) => cd.name === cookieName);
+        return (
+          cookieData?.category === "Analytics" ||
+          cookieData?.category === "Statistics"
+        );
+      }).length,
+      other: data?.cookies.filter((c) => {
+        const cookieName = c.split("=")[0];
+        const cookieData = cookieDatabase.find((cd) => cd.name === cookieName);
+        return (
+          !cookieData ||
+          (cookieData.category !== "Marketing" &&
+            cookieData.category !== "Advertising" &&
+            cookieData.category !== "Analytics" &&
+            cookieData.category !== "Statistics")
+        );
+      }).length,
+    },
+  };
+}
+
+function getScoreColor(score: number): string {
+  if (score <= 20) return "bg-green-500";
+  if (score <= 40) return "bg-yellow-500";
+  if (score <= 60) return "bg-orange-500";
+  return "bg-red-500";
+}
+
+function getScoreDescription(score: number): string {
+  if (score <= 20) return "Boa privacidade";
+  if (score <= 40) return "Privacidade moderada";
+  if (score <= 60) return "Privacidade baixa";
+  return "Privacidade muito baixa";
+}
+
 function App() {
-  const [receivedData, setReceivedData] = useState<{
-    localStorageUsage: number;
-    canvasElements: number;
-    cookieCount: number;
-    cookies: string[];
-  }>();
+  const [receivedData, setReceivedData] = useState<DetectionResponse>();
   const [thirdPartyDomains, setThirdPartyDomains] = useState([]);
   const [thirdPartyCookies, setThirdPartyCookies] = useState<
     Record<string, CookieData>
@@ -39,6 +200,27 @@ function App() {
   const [commonlyBlockedDomains, setCommonlyBlockedDomains] = useState<
     string[]
   >([]);
+  const [privacyScore, setPrivacyScore] = useState({ total: 0, details: {} });
+
+  useEffect(() => {
+    if (receivedData && messagesReceived) {
+      const score = calculatePrivacyScore(
+        receivedData,
+        thirdPartyDomains,
+        thirdPartyCookies,
+        commonlyBlockedDomains,
+        cookieDatabase
+      );
+      setPrivacyScore(score);
+    }
+  }, [
+    receivedData,
+    thirdPartyDomains,
+    thirdPartyCookies,
+    commonlyBlockedDomains,
+    messagesReceived,
+    cookieDatabase,
+  ]);
 
   useEffect(() => {
     fetch("https://big.oisd.nl/")
@@ -118,12 +300,16 @@ function App() {
         }
       );
 
-      chrome.tabs.sendMessage(tabs[0].id, "localStorageCount", (response) => {
-        console.log(response);
-        setReceivedData(response);
-        setMessagesReceived(true);
-        console.log("Recv response = " + response);
-      });
+      chrome.tabs.sendMessage(
+        tabs[0].id,
+        "localStorageCount",
+        (response: SendResponseCallback) => {
+          console.log(response);
+          setReceivedData(response);
+          setMessagesReceived(true);
+          console.log("Recv response = " + response);
+        }
+      );
     });
   }, []);
 
@@ -135,14 +321,21 @@ function App() {
     <div className="min-w-72 max-w-72">
       {messagesReceived ? (
         <>
-          <div className="p-4 bg-green-500 flex flex-col items-center justify-center">
-            <div className="text-5xl font-bold text-white">10</div>
+          <div
+            className={`p-4 ${getScoreColor(
+              privacyScore.total
+            )} flex flex-col items-center justify-center`}
+          >
+            <div className="text-5xl font-bold text-white">
+              {privacyScore.total}
+            </div>
             <div className="text-white text-md uppercase mt-1 font-bold">
               Xereta Score
             </div>
             <div className="text-center mt-2 text-balance text-xs text-white/90">
-              O xereta score mede o quão invasivo é o site que você está. Quanto
-              maior o score, mais invasivo é o site.
+              {getScoreDescription(privacyScore.total)}. O xereta score mede o
+              quão invasivo é o site que você está. Quanto maior o score, mais
+              invasivo é o site.
             </div>
           </div>
           <div className="border-t-[1px] divide-y-[1px]">
@@ -162,9 +355,9 @@ function App() {
                     : "⚠️"
                   : "✅"
               }
-              points={(0.001 * receivedData?.localStorageUsage).toFixed(2)}
+              points={privacyScore.details.localStorage?.toFixed(1)}
             >
-              a
+              <p>0.5 pontos por KB utilizado (máx. 10 pontos)</p>
             </ChecklistItem>
             <ChecklistItem
               title={"Cookies de primeira parte"}
@@ -174,8 +367,12 @@ function App() {
                   : "Não utiliza cookies"
               }
               check={receivedData?.cookieCount > 0 ? "❌" : "✅"}
-              points={1}
+              points={privacyScore.details.firstPartyCookies?.toFixed(1)}
             >
+              <p>
+                1 ponto por cookie, 2 se for de analytics, 3 se for de
+                marketing. (máx. 15 pontos)
+              </p>
               <p>
                 {receivedData?.cookies.map((cookie) => {
                   const cookieName = cookie.split("=")[0];
@@ -209,21 +406,28 @@ function App() {
                   : "Não utiliza cookies de terceiros"
               }
               check={Object.keys(thirdPartyCookies).length > 0 ? "❌" : "✅"}
-              points={1}
+              points={privacyScore.details.thirdPartyCookies?.toFixed(1)}
             >
-              <p>{JSON.stringify(thirdPartyCookies, null, 2)}</p>
+              <p>
+                2 pontos por cookie, 4 se for de analytics, 5 se for de
+                marketing. (máx. 20 pontos)
+              </p>
             </ChecklistItem>
             <ChecklistItem
               title={"Canvas fingerprinting"}
               description={
-                receivedData?.canvasElements > 0
-                  ? `${receivedData?.canvasElements} elementos`
-                  : "Não utiliza Canvas"
+                receivedData?.canvasFingerprinting.potentialFingerprinting
+                  ? "Detectado"
+                  : "Não detectado"
               }
-              check={receivedData?.canvasElements > 0 ? "❌" : "✅"}
-              points={1}
+              check={
+                receivedData?.canvasFingerprinting.potentialFingerprinting
+                  ? "❌"
+                  : "✅"
+              }
+              points={privacyScore.details.canvasFingerprinting?.toFixed(1)}
             >
-              a
+              <p>15 pontos se detectado</p>
             </ChecklistItem>
             <ChecklistItem
               title={"Domínios de terceiros"}
@@ -233,31 +437,22 @@ function App() {
                   : "Não utiliza domínios de terceiros"
               }
               check={thirdPartyDomains.length > 0 ? "❌" : "✅"}
-              points={1}
+              points={privacyScore.details.thirdPartyDomains?.toFixed(1)}
             >
               <p>
+                <p className="opacity-60 mb-2">
+                  1 ponto por domínio, 3 pontos se estiver na lista oisd (máx.
+                  40 pontos)
+                </p>
                 {thirdPartyDomains.length > 0 ? (
-                  <>
-                    <p className="opacity-60 mb-2">
-                      Domínios na lista oisd de bloqueio de anúncios e trackers
-                      contam mais pontos.
+                  thirdPartyDomains.map((domain) => (
+                    <p key={domain}>
+                      {domain}{" "}
+                      <span className="text-xs text-red-500 font-bold">
+                        {commonlyBlockedDomains.includes(domain) ? "oisd" : ""}
+                      </span>
                     </p>
-                    <>
-                      {thirdPartyDomains.map((domain) => {
-                        const isBlocked =
-                          commonlyBlockedDomains.includes(domain);
-
-                        return (
-                          <p key={domain}>
-                            {domain}{" "}
-                            <span className="text-xs text-red-500 font-bold">
-                              {isBlocked ? "oisd" : ""}
-                            </span>
-                          </p>
-                        );
-                      })}
-                    </>
-                  </>
+                  ))
                 ) : (
                   <b>Não solicitou domínios de terceiros</b>
                 )}

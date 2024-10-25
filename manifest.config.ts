@@ -11,7 +11,7 @@ const [major, minor, patch, label = "0"] = version
 
 export default defineManifest(async (env) => ({
   manifest_version: 3,
-  name: `Extensão TecHacker${env.mode ? ` (${env.mode})` : ""}`,
+  name: `Xereta Score${env.mode ? ` (${env.mode})` : ""}`,
   // up to four numbers separated by dots
   version: `${major}.${minor}.${patch}.${label}`,
   // semver is OK in "version_name"
